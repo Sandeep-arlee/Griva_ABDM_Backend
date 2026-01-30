@@ -1,0 +1,26 @@
+{
+  "requestId": "11111111-2222-3333-4444-555555555555",
+  "timestamp": "2026-01-28T10:00:00Z",
+  "notification": {
+    "consentRequestId": "CR-123",
+    "status": "GRANTED",
+    "consentArtefacts": [
+      {
+        "id": "CONSENT-001",
+        "artefact": {
+          "id": "CONSENT-001",
+          "patient": { "id": "abha-1234" },
+          "hiu": { "id": "HIU_TEST" },
+          "hip": { "id": "HIP_TEST" },
+          "permission": {
+            "accessMode": "VIEW",
+            "dateRange": {
+              "from": "2026-01-01T00:00:00Z",
+              "to": "2026-12-31T23:59:59Z"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

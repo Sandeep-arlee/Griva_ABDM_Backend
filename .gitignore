@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+backend/venv/
+.venv/
+
+# Environment variables
+.env
+backend/.env
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Frontend dependencies
+node_modules/
+frontend/node_modules/
