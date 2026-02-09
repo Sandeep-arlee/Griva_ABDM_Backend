@@ -1,9 +1,23 @@
 from logging.config import fileConfig
+import os
+import sys
+
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from app.db.base import Base
-from app.models import audit_log, consent, consent_event, medical_record, patient, user  # noqa
+from app.models import (
+    audit_log,
+    consent,
+    consent_event,
+    health_information_event,
+    health_information_request,
+    medical_record,
+    patient,
+    user,
+)  # noqa
 
 config = context.config
 

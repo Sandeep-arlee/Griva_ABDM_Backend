@@ -1,0 +1,34 @@
+{
+  "requestId": "req-consent-001",
+  "timestamp": "2026-02-09T10:00:00Z",
+  "notification": {
+    "consentRequestId": "cr-001",
+    "status": "GRANTED",
+    "consentArtefacts": [
+      {
+        "id": "consent-001",
+        "hip": { "id": "HIP123" },
+        "hiu": { "id": "HIU123" },
+        "patient": { "id": "patient-001" },
+        "purpose": {
+          "code": "CARE",
+          "refUri": "https://abdm.gov.in/purpose/Care"
+        },
+        "hiTypes": ["OPConsultation"],
+        "permission": {
+          "accessMode": "VIEW",
+          "dateRange": {
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-12-31T23:59:59Z"
+          },
+          "frequency": {
+            "unit": "DAY",
+            "value": 1,
+            "repeats": 1
+          },
+          "dataEraseAt": "2027-01-01T00:00:00Z"
+        }
+      }
+    ]
+  }
+}

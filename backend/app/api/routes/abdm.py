@@ -1,15 +1,23 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.models.audit_log import AuditLog
 from app.models.consent import Consent, ConsentStatus
 from app.models.consent_event import ConsentEvent
-from app.schemas.consent import ConsentNotifyRequest, ConsentNotifyResponse
-from app.schemas.health_info import HealthInformationRequest, HealthInformationResponse
+from app.models.health_information_event import HealthInformationEvent
+from app.models.health_information_request import (
+    HealthInformationRequest as HIRequest,
+    HealthInformationRequestStatus,
+)
+from app.models.medical_record import MedicalRecord
+from app.db.session import SessionLocal
+from app.schemas.consent import ConsentArtefact, ConsentNotifyRequest, ConsentNotifyResponse
+from app.schemas.health_info import HealthInformationRequest, HealthInformationRequestAccepted
 
 router = APIRouter(prefix="/abdm", tags=["abdm"])
 
@@ -55,6 +63,122 @@ def _validate_artefact_id(artefact_id: str) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="INVALID_CONSENT_ARTEFACT_ID",
         )
+
+
+def _extract_allowed_hi_types(consent: Consent) -> set[str] | None:
+    payload = consent.raw_payload or {}
+    notification = payload.get("notification", {})
+    artefacts = notification.get("consentArtefacts", [])
+    for item in artefacts:
+        artefact = item.get("artefact") if isinstance(item, dict) else None
+        if not isinstance(artefact, dict):
+            artefact = item if isinstance(item, dict) else {}
+        if artefact.get("id") == consent.abdm_consent_id:
+            hi_types = artefact.get("hiTypes")
+            if isinstance(hi_types, list):
+                return {str(value) for value in hi_types}
+    return None
+
+
+def _latest_consent_status(db: Session, consent_id: str) -> ConsentStatus | None:
+    event = (
+        db.query(ConsentEvent)
+        .filter(ConsentEvent.consent_id == consent_id)
+        .order_by(ConsentEvent.timestamp.desc(), ConsentEvent.id.desc())
+        .first()
+    )
+    return event.event_type if event else None
+
+
+def _build_transfer_payload(hi_request: HIRequest, consent: Consent, records: list[MedicalRecord]) -> dict:
+    return {
+        "requestId": hi_request.request_id,
+        "timestamp": _now_utc().isoformat().replace("+00:00", "Z"),
+        "consentId": consent.abdm_consent_id,
+        "hipId": hi_request.hip_id,
+        "hiuId": hi_request.hiu_id,
+        "entries": [
+            {
+                "contentRef": {"uri": record.uri},
+                "media": "image/jpeg",
+            }
+            for record in records
+        ],
+    }
+
+
+def _dispatch_transfer(request_id: str) -> None:
+    db = SessionLocal()
+    hi_request = None
+    try:
+        hi_request = db.query(HIRequest).filter(HIRequest.request_id == request_id).first()
+        if not hi_request:
+            return
+
+        consent = db.query(Consent).filter(Consent.id == hi_request.consent_id).first()
+        if not consent:
+            hi_request.status = HealthInformationRequestStatus.FAILED
+            db.add(
+                HealthInformationEvent(
+                    health_information_request_id=hi_request.id,
+                    event_type="TRANSFER_FAILED",
+                    event_payload={"error": "CONSENT_NOT_FOUND"},
+                )
+            )
+            db.commit()
+            return
+
+        hi_request.status = HealthInformationRequestStatus.PROCESSING
+        db.add(
+            HealthInformationEvent(
+                health_information_request_id=hi_request.id,
+                event_type="PROCESSING",
+                event_payload={},
+            )
+        )
+        db.flush()
+
+        date_range = hi_request.date_range or {}
+        from_raw = date_range.get("from")
+        to_raw = date_range.get("to")
+        if not from_raw or not to_raw:
+            raise ValueError("DATE_RANGE_MISSING")
+
+        start = datetime.fromisoformat(str(from_raw).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(to_raw).replace("Z", "+00:00"))
+
+        records = (
+            db.query(MedicalRecord)
+            .filter(MedicalRecord.patient_id == consent.patient_id)
+            .filter(MedicalRecord.created_at >= start)
+            .filter(MedicalRecord.created_at <= end)
+            .all()
+        )
+
+        payload = _build_transfer_payload(hi_request, consent, records)
+        db.add(
+            HealthInformationEvent(
+                health_information_request_id=hi_request.id,
+                event_type="TRANSFER_DISPATCHED",
+                event_payload=payload,
+            )
+        )
+        hi_request.status = HealthInformationRequestStatus.COMPLETED
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        if hi_request:
+            hi_request.status = HealthInformationRequestStatus.FAILED
+            db.add(
+                HealthInformationEvent(
+                    health_information_request_id=hi_request.id,
+                    event_type="TRANSFER_FAILED",
+                    event_payload={"error": str(exc)},
+                )
+            )
+            db.commit()
+    finally:
+        db.close()
 
 
 # -----------------------------
@@ -176,8 +300,27 @@ def consent_notify(
 
     count = 0
 
-    for artefact_ref in payload.notification.consentArtefacts:
-        if not artefact_ref.artefact or not artefact_ref.artefact.id:
+    for artefact_item in payload.notification.consentArtefacts:
+        # ABDM payloads may supply artefacts directly or wrapped under {"id","artefact"}.
+        if isinstance(artefact_item, ConsentArtefact):
+            artefact = artefact_item
+        else:
+            if not artefact_item.artefact or not artefact_item.artefact.id:
+                _audit(
+                    db,
+                    event_type="ABDM_CONSENT_NOTIFY",
+                    headers=headers,
+                    status_code=400,
+                    meta={"error": "INVALID_CONSENT_ARTEFACT"},
+                )
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="INVALID_CONSENT_ARTEFACT",
+                )
+            artefact = artefact_item.artefact
+
+        if not artefact.id:
             _audit(
                 db,
                 event_type="ABDM_CONSENT_NOTIFY",
@@ -191,8 +334,18 @@ def consent_notify(
                 detail="INVALID_CONSENT_ARTEFACT",
             )
 
-        consent_id = artefact_ref.artefact.id
-        artefact = artefact_ref.artefact
+        if artefact.hip.id != headers["hip_id"] or artefact.hiu.id != headers["hiu_id"]:
+            _audit(
+                db,
+                event_type="ABDM_CONSENT_NOTIFY",
+                headers=headers,
+                status_code=400,
+                meta={"error": "HIP_HIU_MISMATCH"},
+            )
+            db.commit()
+            raise HTTPException(status_code=400, detail="HIP_HIU_MISMATCH")
+
+        consent_id = artefact.id
 
         valid_from, valid_to = _parse_dates(artefact)
         if valid_from > valid_to:
@@ -207,7 +360,7 @@ def consent_notify(
             db.commit()
             raise HTTPException(status_code=400, detail="INVALID_CONSENT_DATE_RANGE")
 
-        upsert_stmt = (
+        insert_stmt = (
             insert(Consent)
             .values(
                 abdm_consent_id=consent_id,
@@ -219,21 +372,13 @@ def consent_notify(
                 valid_to=valid_to,
                 raw_payload=payload.model_dump(mode="json", by_alias=True),
             )
-            .on_conflict_do_update(
-                index_elements=[Consent.abdm_consent_id],
-                set_={
-                    "status": ConsentStatus(payload.notification.status),
-                    "valid_from": valid_from,
-                    "valid_to": valid_to,
-                    "raw_payload": payload.model_dump(mode="json", by_alias=True),
-                },
-            )
+            .on_conflict_do_nothing(index_elements=[Consent.abdm_consent_id])
         )
         try:
-            db.execute(upsert_stmt)
+            db.execute(insert_stmt)
         except IntegrityError:
             db.rollback()
-            db.execute(upsert_stmt)
+            db.execute(insert_stmt)
 
         consent = db.query(Consent).filter(Consent.abdm_consent_id == consent_id).one()
 
@@ -264,13 +409,15 @@ def consent_notify(
 # -----------------------------
 @router.post(
     "/health-information/request",
-    response_model=HealthInformationResponse,
+    response_model=HealthInformationRequestAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def health_information_request(
     payload: HealthInformationRequest,
+    background_tasks: BackgroundTasks,
     headers: dict = Depends(_require_abdm_headers),
     db: Session = Depends(get_db),
-) -> HealthInformationResponse:
+) -> HealthInformationRequestAccepted:
     if headers["request_id"] != payload.hiRequest.requestId:
         _audit(
             db,
@@ -283,6 +430,26 @@ def health_information_request(
         raise HTTPException(status_code=400, detail="REQUEST_ID_MISMATCH")
 
     _ensure_utc(payload.hiRequest.timestamp, "REQUEST")
+
+    existing = db.query(HIRequest).filter(HIRequest.request_id == payload.hiRequest.requestId).first()
+    if existing:
+        db.add(
+            HealthInformationEvent(
+                health_information_request_id=existing.id,
+                event_type="DUPLICATE_REQUEST",
+                event_payload={"request_id": payload.hiRequest.requestId},
+            )
+        )
+        _audit(
+            db,
+            event_type="ABDM_HI_REQUEST",
+            headers=headers,
+            status_code=202,
+            consent_id=payload.consentId,
+            meta={"status": "DUPLICATE"},
+        )
+        db.commit()
+        return HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
 
     consent = db.query(Consent).filter(Consent.abdm_consent_id == payload.consentId).first()
 
@@ -298,25 +465,22 @@ def health_information_request(
         db.commit()
         raise HTTPException(status_code=404, detail="CONSENT_NOT_FOUND")
 
-    if consent.status in {
-        ConsentStatus.REQUESTED,
-        ConsentStatus.REVOKED,
-        ConsentStatus.DENIED,
-    }:
-        error = f"CONSENT_{consent.status.name}"
+    latest_status = _latest_consent_status(db, consent.id)
+    if latest_status != ConsentStatus.GRANTED:
+        error = "CONSENT_NOT_GRANTED"
         _audit(
             db,
             event_type="ABDM_HI_REQUEST",
             headers=headers,
-            status_code=403,
+            status_code=409,
             consent_id=payload.consentId,
             meta={"error": error},
         )
         db.commit()
-        raise HTTPException(status_code=403, detail=error)
+        raise HTTPException(status_code=409, detail=error)
 
     now = _now_utc()
-    if consent.status == ConsentStatus.EXPIRED or not (
+    if latest_status == ConsentStatus.EXPIRED or not (
         consent.valid_from <= now <= consent.valid_to
     ):
         _audit(
@@ -328,7 +492,7 @@ def health_information_request(
             meta={"error": "CONSENT_EXPIRED"},
         )
         db.commit()
-        raise HTTPException(status_code=403, detail="CONSENT_EXPIRED")
+        raise HTTPException(status_code=409, detail="CONSENT_EXPIRED")
 
     dr = payload.hiRequest.dateRange
     if dr.from_ > dr.to:
@@ -343,46 +507,98 @@ def health_information_request(
         db.commit()
         raise HTTPException(status_code=400, detail="INVALID_HI_DATE_RANGE")
 
-    if "ImagingStudy" not in payload.hiRequest.hiTypes:
+    allowed_types = _extract_allowed_hi_types(consent)
+    if not allowed_types:
         _audit(
             db,
             event_type="ABDM_HI_REQUEST",
             headers=headers,
-            status_code=400,
+            status_code=422,
             consent_id=payload.consentId,
-            meta={"error": "UNSUPPORTED_HI_TYPE"},
+            meta={"error": "CONSENT_SCOPE_UNKNOWN"},
         )
         db.commit()
-        raise HTTPException(status_code=400, detail="UNSUPPORTED_HI_TYPE")
+        raise HTTPException(status_code=422, detail="CONSENT_SCOPE_UNKNOWN")
+
+    requested_types = set(payload.hiRequest.hiTypes)
+    if not requested_types.issubset(allowed_types):
+        _audit(
+            db,
+            event_type="ABDM_HI_REQUEST",
+            headers=headers,
+            status_code=422,
+            consent_id=payload.consentId,
+            meta={"error": "HI_TYPE_OUTSIDE_CONSENT"},
+        )
+        db.commit()
+        raise HTTPException(status_code=422, detail="HI_TYPE_OUTSIDE_CONSENT")
 
     if dr.from_ < consent.valid_from or dr.to > consent.valid_to:
         _audit(
             db,
             event_type="ABDM_HI_REQUEST",
             headers=headers,
-            status_code=400,
+            status_code=422,
             consent_id=payload.consentId,
             meta={"error": "DATE_RANGE_OUTSIDE_CONSENT"},
         )
         db.commit()
-        raise HTTPException(status_code=400, detail="DATE_RANGE_OUTSIDE_CONSENT")
+        raise HTTPException(status_code=422, detail="DATE_RANGE_OUTSIDE_CONSENT")
+
+    hi_request = HIRequest(
+        request_id=payload.hiRequest.requestId,
+        consent_id=consent.id,
+        hip_id=headers["hip_id"],
+        hiu_id=headers["hiu_id"],
+        status=HealthInformationRequestStatus.REQUESTED,
+        date_range={
+            "from": dr.from_.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "to": dr.to.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    db.add(hi_request)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = db.query(HIRequest).filter(HIRequest.request_id == payload.hiRequest.requestId).first()
+        if existing:
+            db.add(
+                HealthInformationEvent(
+                    health_information_request_id=existing.id,
+                    event_type="DUPLICATE_REQUEST",
+                    event_payload={"request_id": payload.hiRequest.requestId},
+                )
+            )
+            _audit(
+                db,
+                event_type="ABDM_HI_REQUEST",
+                headers=headers,
+                status_code=202,
+                consent_id=payload.consentId,
+                meta={"status": "DUPLICATE"},
+            )
+            db.commit()
+            return HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
+        raise
+
+    db.add(
+        HealthInformationEvent(
+            health_information_request_id=hi_request.id,
+            event_type="REQUESTED",
+            event_payload={"request_id": payload.hiRequest.requestId},
+        )
+    )
 
     _audit(
         db,
         event_type="ABDM_HI_REQUEST",
         headers=headers,
-        status_code=200,
+        status_code=202,
         consent_id=payload.consentId,
-        meta={"status": "OK"},
+        meta={"status": "ACCEPTED"},
     )
     db.commit()
 
-    return HealthInformationResponse(
-        transactionId=payload.transactionId,
-        entries=[
-            {
-                "content": "mock-encrypted-colposcope-image",
-                "media": "image/jpeg",
-            }
-        ],
-    )
+    background_tasks.add_task(_dispatch_transfer, hi_request.request_id)
+    return HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)

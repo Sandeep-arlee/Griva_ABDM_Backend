@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Union
 
 from pydantic import BaseModel, Field
 
@@ -17,14 +17,23 @@ class ConsentPermissionDateRange(BaseModel):
     to: datetime
 
 
-class ConsentPermission(BaseModel):
-    accessMode: str
-    dateRange: ConsentPermissionDateRange
+class ConsentFrequency(BaseModel):
+    unit: str
+    value: int
+    repeats: int
 
 
 class ConsentPurpose(BaseModel):
-    text: str
+    text: str | None = None
     code: str
+    refUri: str
+
+
+class ConsentPermission(BaseModel):
+    accessMode: str
+    dateRange: ConsentPermissionDateRange
+    frequency: ConsentFrequency
+    dataEraseAt: datetime
 
 
 class ConsentArtefact(BaseModel):
@@ -32,20 +41,20 @@ class ConsentArtefact(BaseModel):
     patient: ConsentArtefactPatient
     hiu: ConsentArtefactEntity
     hip: ConsentArtefactEntity
-    purpose: ConsentPurpose | None = None
-    hiTypes: list[str] | None = None
+    purpose: ConsentPurpose
+    hiTypes: list[str]
     permission: ConsentPermission
 
 
 class ConsentArtefactRef(BaseModel):
     id: str
-    artefact: ConsentArtefact | None = None
+    artefact: ConsentArtefact
 
 
 class ConsentNotification(BaseModel):
     consentRequestId: str
     status: str
-    consentArtefacts: list[ConsentArtefactRef]
+    consentArtefacts: list[Union[ConsentArtefactRef, ConsentArtefact]]
 
 
 class ConsentNotifyRequest(BaseModel):

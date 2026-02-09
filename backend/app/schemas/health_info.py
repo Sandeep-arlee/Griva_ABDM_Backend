@@ -28,3 +28,8 @@ class HIEntry(BaseModel):
 class HealthInformationResponse(BaseModel):
     transactionId: str
     entries: list[HIEntry]
+
+
+class HealthInformationRequestAccepted(BaseModel):
+    status: str = "ACCEPTED"
+    requestId: str

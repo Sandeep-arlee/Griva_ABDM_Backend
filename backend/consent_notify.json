@@ -1,5 +1,5 @@
 {
-  "requestId": "11111111-2222-3333-4444-555555555555",
+  "requestId": "req-001",
   "timestamp": "2026-01-28T10:00:00Z",
   "notification": {
     "consentRequestId": "CR-123",
