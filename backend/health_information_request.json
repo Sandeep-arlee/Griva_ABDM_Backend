@@ -1,0 +1,14 @@
+{
+  "transactionId": "txn-hi-001",
+  "consentId": "consent-001",
+  "hiRequest": {
+    "requestId": "hi-req-001",
+    "timestamp": "2026-02-09T11:00:00Z",
+    "dateRange": {
+      "from": "2026-02-01T00:00:00Z",
+      "to": "2026-02-28T23:59:59Z"
+    },
+    "hiTypes": ["OPConsultation"],
+    "dataPushUrl": "https://hiu.example.com/receive-hi"
+  }
+}

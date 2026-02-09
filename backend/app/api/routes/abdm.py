@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
+from app.api.deps import get_current_user, get_db
 from app.models.audit_log import AuditLog
 from app.models.consent import Consent, ConsentStatus
 from app.models.consent_event import ConsentEvent
@@ -202,7 +202,11 @@ def _audit(
         status_code=status_code,
         meta=meta or {},
     )
-    db.add(audit)
+    try:
+        db.add(audit)
+        db.flush()
+    except IntegrityError:
+        db.rollback()
 
 
 # -----------------------------
@@ -217,39 +221,41 @@ def _require_abdm_headers(
     db: Session = Depends(get_db),
 ) -> dict:
     if not all([x_hip_id, x_hiu_id, x_cm_id, x_request_id, x_timestamp]):
-        _audit(
-            db,
-            event_type="ABDM_HEADER_VALIDATION",
-            headers={
-                "hip_id": x_hip_id,
-                "hiu_id": x_hiu_id,
-                "cm_id": x_cm_id,
-                "request_id": x_request_id,
-                "timestamp": x_timestamp,
-            },
-            status_code=status.HTTP_400_BAD_REQUEST,
-            meta={"error": "MISSING_REQUIRED_HEADERS"},
-        )
-        db.commit()
+        if x_request_id:
+            _audit(
+                db,
+                event_type="ABDM_HEADER_VALIDATION",
+                headers={
+                    "hip_id": x_hip_id,
+                    "hiu_id": x_hiu_id,
+                    "cm_id": x_cm_id,
+                    "request_id": x_request_id,
+                    "timestamp": x_timestamp,
+                },
+                status_code=status.HTTP_400_BAD_REQUEST,
+                meta={"error": "MISSING_REQUIRED_HEADERS"},
+            )
+            db.commit()
         raise HTTPException(status_code=400, detail="MISSING_REQUIRED_HEADERS")
 
     try:
         _parse_utc_timestamp(x_timestamp)
     except ValueError as exc:
-        _audit(
-            db,
-            event_type="ABDM_HEADER_VALIDATION",
-            headers={
-                "hip_id": x_hip_id,
-                "hiu_id": x_hiu_id,
-                "cm_id": x_cm_id,
-                "request_id": x_request_id,
-                "timestamp": x_timestamp,
-            },
-            status_code=status.HTTP_400_BAD_REQUEST,
-            meta={"error": str(exc)},
-        )
-        db.commit()
+        if x_request_id:
+            _audit(
+                db,
+                event_type="ABDM_HEADER_VALIDATION",
+                headers={
+                    "hip_id": x_hip_id,
+                    "hiu_id": x_hiu_id,
+                    "cm_id": x_cm_id,
+                    "request_id": x_request_id,
+                    "timestamp": x_timestamp,
+                },
+                status_code=status.HTTP_400_BAD_REQUEST,
+                meta={"error": str(exc)},
+            )
+            db.commit()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
@@ -267,6 +273,7 @@ def _require_abdm_headers(
 @router.post(
     "/consent/notify",
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(get_current_user)],
     response_model=ConsentNotifyResponse,
 )
 def consent_notify(
@@ -410,6 +417,7 @@ def consent_notify(
 @router.post(
     "/health-information/request",
     response_model=HealthInformationRequestAccepted,
+    dependencies=[Depends(get_current_user)],
     status_code=status.HTTP_202_ACCEPTED,
 )
 def health_information_request(
