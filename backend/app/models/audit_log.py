@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import String, DateTime, Integer
+from sqlalchemy import String, DateTime, Integer, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Mapped, mapped_column
@@ -11,6 +11,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     request_id: Mapped[str | None] = mapped_column(String, nullable=True)
     hip_id: Mapped[str | None] = mapped_column(String, nullable=True)

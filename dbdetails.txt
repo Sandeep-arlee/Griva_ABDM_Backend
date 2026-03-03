@@ -1,0 +1,356 @@
+🔒 ABDM HIP Backend — Database Context (Authoritative)
+1️⃣ Active Database Identity
+
+The current working database is:
+
+Database Name: griva
+Host: localhost
+Port: 5432
+User: griva
+Password: griva123
+SSL: Enabled (TLSv1.3)
+PostgreSQL Version: 16.11
+Connection URL:
+postgresql://griva:griva123@localhost:5432/griva
+
+This database is:
+
+Active
+
+Migrated
+
+Non-empty
+
+Schema-initialized
+
+Used for backend execution
+
+⚠️ This database must not be dropped, reset, or modified destructively without explicit instruction.
+
+No advice should include:
+
+Dropping tables
+
+Recreating schema
+
+Deleting data
+
+Manual enum deletion
+
+Truncation
+
+Schema reset
+
+Unless explicitly requested.
+
+2️⃣ Migration State
+
+Alembic is initialized.
+
+Table present:
+
+alembic_version
+
+This confirms:
+
+Migrations have been applied
+
+Schema is version-controlled
+
+DB is not raw
+
+All schema changes must:
+
+Be migration-safe
+
+Preserve data
+
+Avoid enum duplication
+
+Avoid destructive DDL
+
+Consider downgrade paths
+
+3️⃣ Multi-Tenant Architecture
+
+The database is multi-tenant.
+
+Tenant Boundary
+
+Table:
+
+tenants
+
+Referenced by nearly all domain tables.
+
+Core rule:
+
+Tenant isolation must be preserved.
+No cross-tenant operations.
+All data access must be tenant-scoped.
+
+No schema advice may weaken tenant isolation.
+
+4️⃣ Identity & Security Layer
+
+Tables:
+
+users
+
+user_tenant_memberships
+
+tenant_keys
+
+trusted_keys
+
+trusted_requests
+
+Key characteristics:
+
+users.email is globally unique
+
+users.hpr_id is unique
+
+users.status constrained to ACTIVE/DISABLED
+
+tenant relationships enforced via FK
+
+user_tenant_memberships has ON DELETE RESTRICT
+
+This system already enforces identity isolation and HPR linkage.
+
+No schema rewrite should alter:
+
+Email uniqueness
+
+HPR uniqueness
+
+Tenant isolation rules
+
+Foreign key restrictions
+
+5️⃣ Consent Lifecycle Layer
+
+Tables:
+
+consents
+
+consent_events
+
+consent_grants
+
+consent_revocations
+
+internal_consents
+
+Enums:
+
+consent_status
+
+consents table:
+
+UUID primary key
+
+Unique abdm_consent_id
+
+patient_id (string)
+
+hiu_id
+
+hip_id
+
+status (enum)
+
+valid_from
+
+valid_to
+
+raw_payload (jsonb)
+
+tenant_id FK
+
+Indexed appropriately
+
+consent_events:
+
+FK to consents
+
+event_type = consent_status
+
+event_payload jsonb
+
+tenant_id FK
+
+Consent lifecycle already modeled.
+
+No destructive modification of consent data should be suggested.
+
+No suggestion should imply:
+
+Deleting consent history
+
+Mutating raw_payload retroactively
+
+Removing enum values
+
+6️⃣ Health Information Exchange Layer
+
+Tables:
+
+health_information_requests
+
+health_information_events
+
+medical_records
+
+patients
+
+Enums:
+
+hi_request_status
+
+patients table:
+
+UUID PK
+
+patient_id (unique)
+
+tenant_id FK
+
+medical_records:
+
+tenant-scoped
+
+PHI-sensitive
+
+This database contains PHI-sensitive structure.
+
+All operations must assume:
+
+Regulatory exposure
+
+Audit visibility
+
+Data retention obligations
+
+7️⃣ Emergency Access Layer
+
+Tables:
+
+emergency_access_sessions
+
+emergency_access_sessions_v2
+
+emergency_access_events_v2
+
+These represent emergency override access logic.
+
+Foreign keys include ON DELETE RESTRICT.
+
+This is compliance-critical.
+
+No suggestion should:
+
+Remove versioned tables
+
+Merge V1/V2 without migration
+
+Delete emergency history
+
+8️⃣ Audit Logging
+
+Table:
+
+audit_logs
+
+Referenced by tenants.
+
+Audit logs are immutable compliance artifacts.
+
+Never suggest:
+
+Deleting audit logs
+
+Truncating audit logs
+
+Backfilling audit logs without trace
+
+9️⃣ Enum Types Present
+consent_status
+hi_request_status
+
+These are PostgreSQL native enums.
+
+Previous migration issues with enums have occurred.
+
+Therefore:
+
+Never suggest dropping enums
+
+Never suggest recreating enum types manually
+
+Always assume enum changes require safe migration strategy
+
+🔟 Safety Rules For This Database
+
+When operating within this project:
+
+Do not assume empty database.
+
+Do not suggest resetting schema.
+
+Do not recommend dropping tables casually.
+
+Do not suggest manual SQL enum recreation.
+
+Do not suggest disabling foreign keys.
+
+Do not suggest truncating tables.
+
+All schema changes must preserve existing data.
+
+All modifications must be migration-safe.
+
+Assume production-grade compliance requirements.
+
+Assume PHI may exist in medical_records and raw_payload.
+
+11️⃣ Current Operational State
+
+This is:
+
+Fully migrated
+
+Multi-tenant
+
+Identity-enabled
+
+Consent-enabled
+
+Emergency-access-enabled
+
+PHI-capable
+
+Adversarial-auth-tested
+
+This is NOT:
+
+A blank dev DB
+
+A disposable prototype
+
+A temporary schema
+
+12️⃣ Default Assumption Going Forward
+
+Unless explicitly instructed otherwise:
+
+The griva database is persistent and authoritative.
+
+No destructive changes are allowed.
+
+All guidance must protect existing data integrity.
+
+All advice must consider tenant isolation.
+
+All advice must consider audit compliance.

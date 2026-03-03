@@ -12,6 +12,7 @@ class HealthInformationEvent(Base):
     __tablename__ = "health_information_events"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
     health_information_request_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("health_information_requests.id"),

@@ -1,6 +1,6 @@
 import uuid
 import enum
-from sqlalchemy import String, DateTime, Enum
+from sqlalchemy import String, DateTime, Enum, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -22,6 +22,7 @@ class Consent(Base):
     __tablename__ = "consents"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
     abdm_consent_id: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
     patient_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
     hiu_id: Mapped[str] = mapped_column(String, nullable=False)
