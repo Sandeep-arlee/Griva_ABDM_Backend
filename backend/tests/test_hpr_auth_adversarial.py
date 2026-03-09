@@ -1,52 +1,21 @@
 import base64
-import os
 import uuid
 from urllib.parse import urlparse, parse_qs
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
+from sqlalchemy import select
 from app.core.config import settings
 from app.core.security import create_access_token, create_refresh_token
-from app.db.base import Base
 from app.main import app
-from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.user_tenant_membership import UserTenantMembership
 from app.services.hpr_oauth import decode_oauth_state
 from app.routing.policy import _POLICY_REGISTRY
 
 
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 TENANT_A = uuid.UUID("00000000-0000-0000-0000-000000000001")
 TENANT_B = uuid.UUID("00000000-0000-0000-0000-000000000002")
-
-
-@pytest.fixture(scope="module")
-def db_engine():
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set")
-    if settings.database_url != TEST_DATABASE_URL:
-        pytest.skip("DATABASE_URL must point to TEST_DATABASE_URL for integration tests")
-    engine = create_engine(TEST_DATABASE_URL)
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    yield engine
-    Base.metadata.drop_all(bind=engine)
-
-
-@pytest.fixture(scope="module")
-def db_session(db_engine):
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
-    db = SessionLocal()
-    db.info["tenant_id"] = None
-    db.add(Tenant(id=TENANT_A, name="Tenant A"))
-    db.add(Tenant(id=TENANT_B, name="Tenant B"))
-    db.commit()
-    yield db
-    db.close()
 
 
 @pytest.fixture(autouse=True)
@@ -315,10 +284,15 @@ def test_membership_loader_criteria_respected(db_engine, db_session):
     user, membership_a = _make_user_and_membership(db_session, role="DOCTOR", tenant_id=TENANT_A)
     _make_user_and_membership(db_session, role="DOCTOR", tenant_id=TENANT_B)
 
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
-    db = SessionLocal()
-    db.info["tenant_id"] = TENANT_B
-    memberships = db.query(UserTenantMembership).all()
-    db.close()
+    db_session.expunge_all()
+    db_session.info["tenant_id"] = None
+    memberships = (
+        db_session.execute(
+            select(UserTenantMembership).where(UserTenantMembership.tenant_id == TENANT_B)
+        )
+        .scalars()
+        .all()
+    )
 
-    assert all(m.tenant_id == TENANT_B for m in memberships)
+    tenant_ids = {str(m.tenant_id) for m in memberships}
+    assert tenant_ids == {str(TENANT_B)}

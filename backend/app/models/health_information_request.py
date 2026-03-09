@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.models.consent import Consent
+from app.models.tenant_scoped import TenantScoped
 
 
 class HealthInformationRequestStatus(str, enum.Enum):
@@ -23,11 +24,10 @@ hi_request_status_enum = Enum(
 )
 
 
-class HealthInformationRequest(Base):
+class HealthInformationRequest(TenantScoped, Base):
     __tablename__ = "health_information_requests"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
     request_id: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
     consent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("consents.id"), nullable=False)
     hip_id: Mapped[str] = mapped_column(String, nullable=False)

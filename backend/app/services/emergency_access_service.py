@@ -2,14 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import ipaddress
 from uuid import UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.models.audit_log import AuditLog
-from app.models.emergency_access_session import EmergencyAccessSession
+from app.models.emergency_access_v2 import (
+    EmergencyAccessEventV2,
+    EmergencyAccessSessionV2,
+    EmergencyEventType,
+    EmergencyScopeType,
+)
 from app.models.user import User
 
 
@@ -33,15 +40,15 @@ class EmergencyAccessError(Exception):
         self.status_code = status_code
 
 
-def _to_info(session: EmergencyAccessSession) -> EmergencyAccessSessionInfo:
+def _to_info(session: EmergencyAccessSessionV2) -> EmergencyAccessSessionInfo:
     return EmergencyAccessSessionInfo(
         id=session.id,
         tenant_id=session.tenant_id,
         super_admin_id=session.super_admin_id,
         reason=session.reason,
-        approved_by=session.approved_by,
+        approved_by=None,
         approved_at=session.approved_at,
-        created_at=session.created_at,
+        created_at=session.requested_at,
         expires_at=session.expires_at,
         revoked_at=session.revoked_at,
     )
@@ -58,8 +65,12 @@ def _audit_emergency_event(
     user_agent: str | None,
 ) -> None:
     audit = AuditLog(
+        actor=str(super_admin_id),
+        action=event_type,
+        resource_type="emergency_session",
+        resource_id=str(session_id),
         event_type=event_type,
-        request_id=None,
+        request_id=f"emergency-{session_id}",
         hip_id=None,
         hiu_id=None,
         cm_id=None,
@@ -76,6 +87,40 @@ def _audit_emergency_event(
         tenant_id=tenant_id,
     )
     db.add(audit)
+
+
+def _insert_emergency_event_v2(
+    db: Session,
+    session: EmergencyAccessSessionV2,
+    event_type: EmergencyEventType,
+    ip: str | None,
+    user_agent: str | None,
+) -> None:
+    normalized_ip = _normalize_ip(ip)
+    db.add(
+        EmergencyAccessEventV2(
+            session_id=session.id,
+            tenant_id=session.tenant_id,
+            super_admin_id=session.super_admin_id,
+            event_type=event_type,
+            resource_type=None,
+            resource_id=None,
+            record_count=None,
+            payload_size_bytes=None,
+            ip=normalized_ip,
+            user_agent=user_agent or "unknown",
+            created_at=func.now(),
+        )
+    )
+
+
+def _normalize_ip(ip: str | None) -> str:
+    if not ip:
+        return "127.0.0.1"
+    try:
+        return str(ipaddress.ip_address(ip))
+    except ValueError:
+        return "127.0.0.1"
 
 
 def request_emergency_access(
@@ -101,26 +146,35 @@ def request_emergency_access(
     now = datetime.now(timezone.utc)
     # Fail-closed: do not allow overlapping active sessions for the same tenant/admin.
     active = (
-        db.query(EmergencyAccessSession)
+        db.query(EmergencyAccessSessionV2)
         .filter(
-            EmergencyAccessSession.tenant_id == tenant_id,
-            EmergencyAccessSession.super_admin_id == user.id,
-            EmergencyAccessSession.revoked_at.is_(None),
-            EmergencyAccessSession.expires_at > now,
+            EmergencyAccessSessionV2.tenant_id == tenant_id,
+            EmergencyAccessSessionV2.super_admin_id == user.id,
+            EmergencyAccessSessionV2.revoked_at.is_(None),
+            EmergencyAccessSessionV2.expires_at > now,
         )
         .first()
     )
     if active:
         raise EmergencyAccessError("EMERGENCY_ACCESS_ACTIVE", 409)
 
+    normalized_ip = _normalize_ip(ip)
     expires_at = now + timedelta(minutes=duration)
-    session = EmergencyAccessSession(
+    session = EmergencyAccessSessionV2(
         tenant_id=tenant_id,
         super_admin_id=user.id,
+        scope_type=EmergencyScopeType.TENANT_WIDE,
+        scope_patient_id=None,
         reason=trimmed_reason,
-        approved_by=user.id,
+        requested_at=now,
         approved_at=now,
         expires_at=expires_at,
+        created_ip=normalized_ip,
+        created_user_agent=user_agent or "unknown",
+        decrypt_count=0,
+        export_count=0,
+        export_payload_bytes=0,
+        last_used_at=None,
     )
     db.add(session)
     try:
@@ -129,6 +183,9 @@ def request_emergency_access(
         db.rollback()
         raise EmergencyAccessError("EMERGENCY_ACCESS_ACTIVE", 409) from exc
 
+    _insert_emergency_event_v2(db, session, EmergencyEventType.REQUESTED, normalized_ip, user_agent)
+    _insert_emergency_event_v2(db, session, EmergencyEventType.APPROVED, normalized_ip, user_agent)
+
     _audit_emergency_event(
         db,
         "EMERGENCY_ACCESS_REQUESTED",
@@ -136,7 +193,7 @@ def request_emergency_access(
         user.id,
         session.id,
         trimmed_reason,
-        ip,
+        normalized_ip,
         user_agent,
     )
     _audit_emergency_event(
@@ -146,7 +203,7 @@ def request_emergency_access(
         user.id,
         session.id,
         trimmed_reason,
-        ip,
+        normalized_ip,
         user_agent,
     )
 
@@ -160,14 +217,14 @@ def validate_emergency_access(
 ) -> EmergencyAccessSessionInfo | None:
     now = datetime.now(timezone.utc)
     session = (
-        db.query(EmergencyAccessSession)
+        db.query(EmergencyAccessSessionV2)
         .filter(
-            EmergencyAccessSession.tenant_id == tenant_id,
-            EmergencyAccessSession.super_admin_id == super_admin_id,
-            EmergencyAccessSession.revoked_at.is_(None),
-            EmergencyAccessSession.expires_at > now,
+            EmergencyAccessSessionV2.tenant_id == tenant_id,
+            EmergencyAccessSessionV2.super_admin_id == super_admin_id,
+            EmergencyAccessSessionV2.revoked_at.is_(None),
+            EmergencyAccessSessionV2.expires_at > now,
         )
-        .order_by(EmergencyAccessSession.expires_at.desc())
+        .order_by(EmergencyAccessSessionV2.expires_at.desc())
         .first()
     )
     if not session:
@@ -210,11 +267,11 @@ def revoke_emergency_access(
         raise EmergencyAccessError("FORBIDDEN", 403)
 
     session = (
-        db.query(EmergencyAccessSession)
+        db.query(EmergencyAccessSessionV2)
         .filter(
-            EmergencyAccessSession.id == session_id,
-            EmergencyAccessSession.tenant_id == tenant_id,
-            EmergencyAccessSession.super_admin_id == user.id,
+            EmergencyAccessSessionV2.id == session_id,
+            EmergencyAccessSessionV2.tenant_id == tenant_id,
+            EmergencyAccessSessionV2.super_admin_id == user.id,
         )
         .first()
     )
@@ -227,6 +284,8 @@ def revoke_emergency_access(
     session.revoked_at = now
     db.add(session)
 
+    normalized_ip = _normalize_ip(ip)
+    _insert_emergency_event_v2(db, session, EmergencyEventType.REVOKED, normalized_ip, user_agent)
     _audit_emergency_event(
         db,
         "EMERGENCY_ACCESS_REVOKED",
@@ -234,7 +293,7 @@ def revoke_emergency_access(
         user.id,
         session.id,
         session.reason,
-        ip,
+        normalized_ip,
         user_agent,
     )
 

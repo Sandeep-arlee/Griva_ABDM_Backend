@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     platform_identity_key_b64: str = Field(default="", alias="PLATFORM_IDENTITY_KEY_B64")
     platform_identity_key_id: str = Field(default="1", alias="PLATFORM_IDENTITY_KEY_ID")
+    tenant_master_key_b64: str = Field(default="", alias="TENANT_MASTER_KEY_B64")
 
     admin_email: str | None = Field(default=None, alias="ADMIN_EMAIL")
     admin_password: str | None = Field(default=None, alias="ADMIN_PASSWORD")

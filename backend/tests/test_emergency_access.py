@@ -1,50 +1,30 @@
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from app.api.deps import get_current_user, get_db
-from app.core.config import settings
-from app.db.base import Base
+from app.core.security import create_access_token
 from app.main import app
 from app.models.consent import Consent, ConsentStatus
-from app.models.emergency_access_session import EmergencyAccessSession
-from app.models.tenant import Tenant
+from app.models.emergency_access_v2 import EmergencyAccessSessionV2, EmergencyScopeType
+from app.models.internal_consent import InternalConsent
 from app.models.user import User
-from app.tenancy import get_current_tenant_id
+from app.models.user_tenant_membership import UserTenantMembership
 
 
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 OTHER_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 SUPERADMIN_ID = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 SUPERADMIN_EMAIL = "superadmin@test.local"
+AUTH_TOKEN: str | None = None
 
 
-class DummyUser:
-    def __init__(self, user_id, role):
-        self.id = user_id
-        self.role = role
 
 
-@pytest.fixture(scope="module")
-def db_session():
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set")
-    engine = create_engine(TEST_DATABASE_URL)
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    db = SessionLocal()
-    db.info["tenant_id"] = None
-    db.add(Tenant(id=TENANT_ID, name="Tenant A"))
-    db.add(Tenant(id=OTHER_TENANT_ID, name="Tenant B"))
-    db.commit()
+@pytest.fixture()
+def client(db_session):
+    global AUTH_TOKEN
     super_admin = User(
         id=SUPERADMIN_ID,
         email=SUPERADMIN_EMAIL,
@@ -53,7 +33,15 @@ def db_session():
         is_active=True,
         tenant_id=TENANT_ID,
     )
-    db.add(super_admin)
+    db_session.add(super_admin)
+    membership = UserTenantMembership(
+        id=uuid.uuid4(),
+        user_id=super_admin.id,
+        tenant_id=TENANT_ID,
+        role="SUPERADMIN",
+        status="ACTIVE",
+    )
+    db_session.add(membership)
     now = datetime.now(timezone.utc)
     other_consent = Consent(
         tenant_id=OTHER_TENANT_ID,
@@ -66,40 +54,38 @@ def db_session():
         valid_to=now + timedelta(days=1),
         raw_payload={},
     )
-    db.add(other_consent)
-    db.commit()
-    try:
-        yield db
-    finally:
-        db.close()
-        Base.metadata.drop_all(bind=engine)
+    db_session.add(other_consent)
+    db_session.commit()
+    AUTH_TOKEN = create_access_token(
+        str(super_admin.id),
+        extra_claims={
+            "user_id": str(super_admin.id),
+            "tenant_id": str(TENANT_ID),
+            "membership_id": str(membership.id),
+            "role": "SUPERADMIN",
+        },
+    )
 
-
-@pytest.fixture(scope="module")
-def client(db_session):
-    def _get_db_override():
-        tenant_id = get_current_tenant_id()
-        if settings.strict_tenant_mode and not tenant_id:
-            raise HTTPException(status_code=400, detail="TENANT_REQUIRED")
-        if tenant_id:
-            exists = db_session.query(Tenant).filter(Tenant.id == tenant_id).first()
-            if not exists:
-                raise HTTPException(status_code=400, detail="TENANT_NOT_FOUND")
-            db_session.info["tenant_id"] = tenant_id
-        try:
-            yield db_session
-        finally:
-            db_session.info.pop("tenant_id", None)
-
-    app.dependency_overrides[get_db] = _get_db_override
-    app.dependency_overrides[get_current_user] = lambda: DummyUser(SUPERADMIN_ID, "SUPERADMIN")
     with TestClient(app) as test_client:
         yield test_client
-    app.dependency_overrides.clear()
 
 
 def _headers(tenant_id=TENANT_ID):
-    return {"X-Tenant-ID": str(tenant_id)}
+    headers = {"X-Tenant-ID": str(tenant_id)}
+    if AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+    return headers
+
+def _grant_internal_consent(db_session, patient_id: str):
+    consent = InternalConsent(
+        tenant_id=TENANT_ID,
+        subject_patient_id=patient_id,
+        purpose="CARE",
+        status="GRANTED",
+        meta={},
+    )
+    db_session.add(consent)
+    db_session.commit()
 
 
 def _request_emergency_access(client, reason="Emergency access required"):
@@ -108,38 +94,42 @@ def _request_emergency_access(client, reason="Emergency access required"):
 
 
 def test_superadmin_blocked_without_emergency_session(client):
-    resp = client.get("/api/consents", headers=_headers())
+    resp = client.get("/api/patients/patient-1/records", headers=_headers())
     assert resp.status_code == 403
     assert resp.json()["detail"] == "EMERGENCY_ACCESS_REQUIRED"
 
 
-def test_access_with_valid_session(client):
+def test_access_with_valid_session(client, db_session):
+    _grant_internal_consent(db_session, "patient-1")
     resp = _request_emergency_access(client)
     assert resp.status_code == 201
 
-    resp2 = client.get("/api/consents", headers=_headers())
+    resp2 = client.get("/api/patients/patient-1/records", headers=_headers())
     assert resp2.status_code == 200
 
 
-def test_no_tenant_filter_bypass(client):
-    resp = client.get("/api/consents", headers=_headers())
+def test_no_tenant_filter_bypass(client, db_session):
+    _grant_internal_consent(db_session, "patient-1")
+    resp = _request_emergency_access(client)
+    assert resp.status_code == 201
+    resp = client.get("/api/patients/patient-1/records", headers=_headers())
     assert resp.status_code == 200
     assert resp.json() == []
 
 
 def test_cannot_access_different_tenant(client):
-    resp = client.get("/api/consents", headers=_headers(OTHER_TENANT_ID))
+    resp = client.get("/api/patients/patient-1/records", headers=_headers(OTHER_TENANT_ID))
     assert resp.status_code == 403
     assert resp.json()["detail"] == "EMERGENCY_ACCESS_REQUIRED"
 
 
 def test_overlapping_sessions_prevented(client, db_session):
     now = datetime.now(timezone.utc)
-    db_session.query(EmergencyAccessSession).filter(
-        EmergencyAccessSession.tenant_id == TENANT_ID,
-        EmergencyAccessSession.revoked_at.is_(None),
-        EmergencyAccessSession.expires_at > now,
-    ).update({EmergencyAccessSession.revoked_at: now})
+    db_session.query(EmergencyAccessSessionV2).filter(
+        EmergencyAccessSessionV2.tenant_id == TENANT_ID,
+        EmergencyAccessSessionV2.revoked_at.is_(None),
+        EmergencyAccessSessionV2.expires_at > now,
+    ).update({EmergencyAccessSessionV2.revoked_at: now})
     db_session.commit()
 
     first = _request_emergency_access(client, reason="Overlap prevention test")
@@ -152,27 +142,34 @@ def test_overlapping_sessions_prevented(client, db_session):
 
 def test_expired_session_blocks_access(client, db_session):
     now = datetime.now(timezone.utc)
-    db_session.query(EmergencyAccessSession).filter(
-        EmergencyAccessSession.tenant_id == TENANT_ID,
-        EmergencyAccessSession.revoked_at.is_(None),
-        EmergencyAccessSession.expires_at > now,
-    ).update({EmergencyAccessSession.revoked_at: now})
+    db_session.query(EmergencyAccessSessionV2).filter(
+        EmergencyAccessSessionV2.tenant_id == TENANT_ID,
+        EmergencyAccessSessionV2.revoked_at.is_(None),
+        EmergencyAccessSessionV2.expires_at > now,
+    ).update({EmergencyAccessSessionV2.revoked_at: now})
     db_session.commit()
 
-    expired = EmergencyAccessSession(
+    expired = EmergencyAccessSessionV2(
         tenant_id=TENANT_ID,
         super_admin_id=SUPERADMIN_ID,
+        scope_type=EmergencyScopeType.TENANT_WIDE,
+        scope_patient_id=None,
         reason="Expired session",
-        approved_by=None,
-        approved_at=None,
-        created_at=now - timedelta(hours=2),
+        requested_at=now - timedelta(hours=2),
+        approved_at=now - timedelta(hours=2),
         expires_at=now - timedelta(hours=1),
         revoked_at=None,
+        created_ip="127.0.0.1",
+        created_user_agent="pytest",
+        decrypt_count=0,
+        export_count=0,
+        export_payload_bytes=0,
+        last_used_at=None,
     )
     db_session.add(expired)
     db_session.commit()
 
-    resp = client.get("/api/consents", headers=_headers())
+    resp = client.get("/api/patients/patient-1/records", headers=_headers())
     assert resp.status_code == 403
     assert resp.json()["detail"] == "EMERGENCY_ACCESS_REQUIRED"
 
@@ -185,7 +182,7 @@ def test_revoke_blocks_access(client):
     revoke_resp = client.post(f"/admin/emergency-access/revoke/{session_id}", headers=_headers())
     assert revoke_resp.status_code == 200
 
-    resp2 = client.get("/api/consents", headers=_headers())
+    resp2 = client.get("/api/patients/patient-1/records", headers=_headers())
     assert resp2.status_code == 403
     assert resp2.json()["detail"] == "EMERGENCY_ACCESS_REQUIRED"
 

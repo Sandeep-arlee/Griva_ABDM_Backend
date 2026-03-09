@@ -25,6 +25,7 @@ from app.models.audit_log import AuditLog
 from app.models.internal_consent import InternalConsent
 from app.models.tenant import Tenant
 from app.models.trusted_request import TrustedRequest
+from app.services.idempotency_service import check_request
 from app.tenancy import get_current_tenant_id
 
 
@@ -179,6 +180,10 @@ def _audit_signature_event(
     tenant_id = db.info.get("tenant_id")
     audit = AuditLog(
         tenant_id=tenant_id,
+        actor="system",
+        action="ABDM_SIGNATURE",
+        resource_type="request",
+        resource_id=effective_request_id,
         event_type="ABDM_SIGNATURE",
         request_id=effective_request_id,
         hip_id=None,
@@ -280,6 +285,18 @@ def verify_abdm_signature(request: Request, db: Session = Depends(get_db)) -> No
         db.commit()
     except IntegrityError:
         db.rollback()
+        tenant_id = db.info.get("tenant_id")
+        if tenant_id and check_request(db, tenant_id, request_id, request.url.path):
+            _audit_signature_event(
+                db,
+                request_id,
+                key_id,
+                "REPLAY_DETECTED",
+                request.url.path,
+                status.HTTP_200_OK,
+                timestamp,
+            )
+            return
         _audit_signature_event(
             db,
             request_id,

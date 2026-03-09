@@ -20,6 +20,7 @@ from app.api.routes import (
 from app.core.config import settings
 from app.core.security import get_password_hash
 from app.db.session import SessionLocal
+from app.middleware.idempotency import IdempotencyMiddleware
 from app.middleware.emergency_enforcement import EmergencyEnforcementMiddleware
 from app.models.user import User
 from app.routing.policy import RouteClass, route_policy, validate_route_policies
@@ -49,7 +50,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.project_name, lifespan=lifespan)
 
 # Starlette prepends middleware; execution order matches the reverse of add_middleware calls.
-# Desired execution: TenantContext -> DBSession -> AuthContext -> EmergencyEnforcement -> RawBody
+# Desired execution: TenantContext -> DBSession -> AuthContext -> EmergencyEnforcement -> RawBody -> Idempotency
+app.add_middleware(IdempotencyMiddleware)
 app.add_middleware(RawBodyMiddleware)
 app.add_middleware(EmergencyEnforcementMiddleware)
 app.add_middleware(AuthContextMiddleware)

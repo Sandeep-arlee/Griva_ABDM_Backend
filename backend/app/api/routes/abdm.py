@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import json
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -19,10 +19,13 @@ from app.models.health_information_request import (
 )
 from app.models.medical_record import MedicalRecord
 from app.db.session import SessionLocal
+from app.services.abha_service import get_patient_by_abha
+from app.services.idempotency_service import check_request, store_response
 from app.tenancy import get_current_tenant_id, reset_current_tenant_id, set_current_tenant_id
 from app.schemas.consent import ConsentArtefact, ConsentNotifyRequest, ConsentNotifyResponse
 from app.schemas.health_info import HealthInformationRequest, HealthInformationRequestAccepted
 from app.routing.policy import RouteClass, route_policy
+from app.utils.audit_enforced import audited
 
 router = APIRouter(prefix="/abdm", tags=["abdm"])
 
@@ -92,7 +95,7 @@ def _latest_consent_status(db: Session, consent_id: str) -> ConsentStatus | None
         .order_by(ConsentEvent.timestamp.desc(), ConsentEvent.id.desc())
         .first()
     )
-    return event.event_type if event else None
+    return event.new_status if event else None
 
 
 def _build_transfer_payload(hi_request: HIRequest, consent: Consent, records: list[MedicalRecord]) -> dict:
@@ -210,8 +213,14 @@ def _audit(
     meta: dict | None = None,
 ) -> None:
     tenant_id = db.info.get("tenant_id")
+    resource_id = consent_id or headers.get("request_id") or "unknown"
+    resource_type = "consent" if consent_id else "request"
     audit = AuditLog(
         tenant_id=tenant_id,
+        actor="abdm",
+        action=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
         event_type=event_type,
         request_id=headers.get("request_id"),
         hip_id=headers.get("hip_id"),
@@ -289,6 +298,11 @@ def _require_abdm_headers(
 # -----------------------------
 # Consent Notify
 # -----------------------------
+@audited(
+    action="ABDM_CONSENT_NOTIFY",
+    resource_type="request",
+    resource_id_getter=lambda _result, _args, kwargs: kwargs.get("headers", {}).get("request_id"),
+)
 @router.post(
     "/consent/notify",
     status_code=status.HTTP_202_ACCEPTED,
@@ -312,6 +326,7 @@ def _require_abdm_headers(
 )
 def consent_notify(
     payload: ConsentNotifyRequest,
+    request: Request,
     response: Response,
     headers: dict = Depends(_require_abdm_headers),
     db: Session = Depends(get_db),
@@ -343,6 +358,26 @@ def consent_notify(
     tenant_id = db.info.get("tenant_id")
     if not tenant_id:
         raise HTTPException(status_code=400, detail="TENANT_REQUIRED")
+
+    existing = check_request(db, tenant_id, headers["request_id"], request.url.path)
+    if existing:
+        response.status_code = existing.status_code or status.HTTP_202_ACCEPTED
+        resp_body = ConsentNotifyResponse(received=len(payload.notification.consentArtefacts))
+        response_payload = resp_body.model_dump(mode="json")
+        timestamp = utc_now_iso()
+        body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        canonical = canonicalize_response(
+            response.status_code,
+            "/abdm/consent/notify",
+            headers["request_id"],
+            timestamp,
+            body_hash,
+        )
+        signature = sign_response(settings.abdm_private_key_pem, canonical)
+        response.headers["X-Signature"] = signature
+        response.headers["X-Key-Id"] = settings.abdm_key_id
+        response.headers["X-Timestamp"] = timestamp
+        return resp_body
 
     count = 0
 
@@ -393,6 +428,31 @@ def consent_notify(
             raise HTTPException(status_code=400, detail="HIP_HIU_MISMATCH")
 
         consent_id = artefact.id
+        abha = artefact.patient.id if artefact and artefact.patient and artefact.patient.id else None
+        if not abha:
+            _audit(
+                db,
+                event_type="ABDM_CONSENT_NOTIFY",
+                headers=headers,
+                status_code=400,
+                consent_id=consent_id,
+                meta={"error": "PATIENT_NOT_LINKED"},
+            )
+            db.commit()
+            raise HTTPException(status_code=400, detail="PATIENT_NOT_LINKED")
+
+        patient = get_patient_by_abha(db, tenant_id, abha)
+        if not patient:
+            _audit(
+                db,
+                event_type="ABDM_CONSENT_NOTIFY",
+                headers=headers,
+                status_code=400,
+                consent_id=consent_id,
+                meta={"error": "PATIENT_NOT_LINKED"},
+            )
+            db.commit()
+            raise HTTPException(status_code=400, detail="PATIENT_NOT_LINKED")
 
         valid_from, valid_to = _parse_dates(artefact)
         if valid_from > valid_to:
@@ -412,7 +472,7 @@ def consent_notify(
             .values(
                 abdm_consent_id=consent_id,
                 tenant_id=tenant_id,
-                patient_id=_safe_entity_id(artefact.patient if artefact else None, "UNKNOWN"),
+                patient_id=patient.patient_id,
                 hiu_id=_safe_entity_id(artefact.hiu if artefact else None, "UNKNOWN"),
                 hip_id=_safe_entity_id(artefact.hip if artefact else None, "UNKNOWN"),
                 status=ConsentStatus(payload.notification.status),
@@ -430,14 +490,24 @@ def consent_notify(
 
         consent = db.query(Consent).filter(Consent.abdm_consent_id == consent_id).one()
 
-        db.add(
-            ConsentEvent(
-                tenant_id=tenant_id,
-                consent=consent,
-                event_type=ConsentStatus(payload.notification.status),
-                event_payload=payload.model_dump(mode="json", by_alias=True),
-            )
+        new_status = ConsentStatus(payload.notification.status)
+        old_status = _latest_consent_status(db, consent.id) or new_status
+        existing_event = (
+            db.query(ConsentEvent)
+            .filter(ConsentEvent.consent_id == consent.id, ConsentEvent.new_status == new_status)
+            .first()
         )
+        if not existing_event:
+            db.add(
+                ConsentEvent(
+                    tenant_id=tenant_id,
+                    consent=consent,
+                    old_status=old_status,
+                    new_status=new_status,
+                    event_type=new_status,
+                    event_payload=payload.model_dump(mode="json", by_alias=True),
+                )
+            )
 
         count += 1
 
@@ -449,8 +519,16 @@ def consent_notify(
         status_code=202,
         meta={"consents": count, "status": payload.notification.status},
     )
-    db.commit()
     resp_body = ConsentNotifyResponse(received=count)
+    store_response(
+        db,
+        tenant_id=tenant_id,
+        request_id=headers["request_id"],
+        endpoint=request.url.path,
+        response=resp_body,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    db.commit()
     response_payload = resp_body.model_dump(mode="json")
     timestamp = utc_now_iso()
     body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
@@ -471,6 +549,11 @@ def consent_notify(
 # -----------------------------
 # Health Information Request
 # -----------------------------
+@audited(
+    action="ABDM_HI_REQUEST",
+    resource_type="request",
+    resource_id_getter=lambda _result, _args, kwargs: kwargs.get("headers", {}).get("request_id"),
+)
 @router.post(
     "/health-information/request",
     response_model=HealthInformationRequestAccepted,
@@ -495,6 +578,7 @@ def consent_notify(
 def health_information_request(
     payload: HealthInformationRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     response: Response,
     headers: dict = Depends(_require_abdm_headers),
     db: Session = Depends(get_db),
@@ -502,6 +586,26 @@ def health_information_request(
     tenant_id = db.info.get("tenant_id")
     if not tenant_id:
         raise HTTPException(status_code=400, detail="TENANT_REQUIRED")
+
+    existing = check_request(db, tenant_id, headers["request_id"], request.url.path)
+    if existing:
+        response.status_code = existing.status_code or status.HTTP_202_ACCEPTED
+        resp_body = HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
+        response_payload = resp_body.model_dump(mode="json")
+        timestamp = utc_now_iso()
+        body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        canonical = canonicalize_response(
+            response.status_code,
+            "/abdm/health-information/request",
+            headers["request_id"],
+            timestamp,
+            body_hash,
+        )
+        signature = sign_response(settings.abdm_private_key_pem, canonical)
+        response.headers["X-Signature"] = signature
+        response.headers["X-Key-Id"] = settings.abdm_key_id
+        response.headers["X-Timestamp"] = timestamp
+        return resp_body
 
     if headers["request_id"] != payload.hiRequest.requestId:
         _audit(
@@ -534,8 +638,16 @@ def health_information_request(
             consent_id=payload.consentId,
             meta={"status": "DUPLICATE"},
         )
-        db.commit()
         resp_body = HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
+        store_response(
+            db,
+            tenant_id=tenant_id,
+            request_id=headers["request_id"],
+            endpoint=request.url.path,
+            response=resp_body,
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+        db.commit()
         response_payload = resp_body.model_dump(mode="json")
         timestamp = utc_now_iso()
         body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
@@ -681,8 +793,16 @@ def health_information_request(
                 consent_id=payload.consentId,
                 meta={"status": "DUPLICATE"},
             )
-            db.commit()
             resp_body = HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
+            store_response(
+                db,
+                tenant_id=tenant_id,
+                request_id=headers["request_id"],
+                endpoint=request.url.path,
+                response=resp_body,
+                status_code=status.HTTP_202_ACCEPTED,
+            )
+            db.commit()
             response_payload = resp_body.model_dump(mode="json")
             timestamp = utc_now_iso()
             body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
@@ -717,11 +837,19 @@ def health_information_request(
         consent_id=payload.consentId,
         meta={"status": "ACCEPTED"},
     )
+    resp_body = HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
+    store_response(
+        db,
+        tenant_id=tenant_id,
+        request_id=headers["request_id"],
+        endpoint=request.url.path,
+        response=resp_body,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
     db.commit()
 
     tenant_id = get_current_tenant_id()
     background_tasks.add_task(_dispatch_transfer, hi_request.request_id, tenant_id)
-    resp_body = HealthInformationRequestAccepted(requestId=payload.hiRequest.requestId)
     response_payload = resp_body.model_dump(mode="json")
     timestamp = utc_now_iso()
     body_hash = hash_body(json.dumps(response_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))

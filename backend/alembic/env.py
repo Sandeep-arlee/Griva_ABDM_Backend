@@ -21,6 +21,7 @@ from app.models import (
     internal_consent,
     medical_record,
     patient,
+    patient_abha_link,
     tenant,
     tenant_key,
     trusted_key,

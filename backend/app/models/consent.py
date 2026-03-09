@@ -1,11 +1,12 @@
 import uuid
 import enum
-from sqlalchemy import String, DateTime, Enum, ForeignKey
+from sqlalchemy import String, DateTime, Enum
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+from app.models.tenant_scoped import TenantScoped
 
 class ConsentStatus(str, enum.Enum):
     REQUESTED = "REQUESTED"
@@ -18,11 +19,10 @@ class ConsentStatus(str, enum.Enum):
 consent_status_enum = Enum(ConsentStatus, name="consent_status", create_type=False)
 
 
-class Consent(Base):
+class Consent(TenantScoped, Base):
     __tablename__ = "consents"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
     abdm_consent_id: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
     patient_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
     hiu_id: Mapped[str] = mapped_column(String, nullable=False)

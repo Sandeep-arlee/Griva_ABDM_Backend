@@ -2,50 +2,39 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session, with_loader_criteria
 
 from app.core.config import settings
-from app.models.audit_log import AuditLog
-from app.models.consent import Consent
-from app.models.consent_event import ConsentEvent
-from app.models.health_information_event import HealthInformationEvent
-from app.models.health_information_request import HealthInformationRequest
-from app.models.internal_consent import InternalConsent
-from app.models.medical_record import MedicalRecord
-from app.models.patient import Patient
-from app.models.tenant_key import TenantKey
-from app.models.trusted_request import TrustedRequest
+from app.db.base import Base
+from app.models.user import User
 from app.models.user_tenant_membership import UserTenantMembership
-from app.models.consent_grant import ConsentGrant
-from app.models.consent_revocation import ConsentRevocation
-from app.models.emergency_access_session import EmergencyAccessSession
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-_TENANT_MODELS = (
-    Patient,
-    Consent,
-    ConsentEvent,
-    MedicalRecord,
-    AuditLog,
-    HealthInformationRequest,
-    HealthInformationEvent,
-    TrustedRequest,
-    TenantKey,
-    InternalConsent,
-    ConsentGrant,
-    ConsentRevocation,
-    EmergencyAccessSession,
-    UserTenantMembership,
-)
+_TENANT_EXCLUSIONS = {User}
 
 
 @event.listens_for(Session, "do_orm_execute")
 def _add_tenant_criteria(execute_state):
     tenant_id = execute_state.session.info.get("tenant_id")
-    if not tenant_id or not execute_state.is_select:
+    if not tenant_id:
         return
-    for model in _TENANT_MODELS:
+    statement = execute_state.statement
+    if not getattr(statement, "is_select", False):
+        return
+    execute_state.statement = execute_state.statement.options(
+        with_loader_criteria(
+            UserTenantMembership,
+            lambda model_cls, tenant_id=tenant_id: model_cls.tenant_id == tenant_id,
+            include_aliases=True,
+        )
+    )
+    for mapper in Base.registry.mappers:
+        cls = mapper.class_
+        if cls in _TENANT_EXCLUSIONS:
+            continue
+        if not hasattr(cls, "tenant_id"):
+            continue
         execute_state.statement = execute_state.statement.options(
-            with_loader_criteria(model, lambda cls, tenant_id=tenant_id: cls.tenant_id == tenant_id, include_aliases=True)
+            with_loader_criteria(cls, lambda model_cls, tenant_id=tenant_id: model_cls.tenant_id == tenant_id, include_aliases=True)
         )
 
 

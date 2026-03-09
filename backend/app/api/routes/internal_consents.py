@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_roles
@@ -12,10 +12,17 @@ from app.schemas.internal_consent import (
     InternalConsentRevokeRequest,
     InternalConsentResponse,
 )
+from app.utils.audit_enforced import audited
 
 router = APIRouter(prefix="/api/internal-consents", tags=["internal-consents"])
 
 
+@audited(
+    action="INTERNAL_CONSENT_GRANT",
+    resource_type="internal_consent",
+    resource_id_getter=lambda result, _args, _kwargs: str(result.id),
+    use_request_id=False,
+)
 @router.post("/grant", response_model=InternalConsentResponse, status_code=status.HTTP_201_CREATED)
 @route_policy(
     route_class=RouteClass.GOVERNANCE_MUTATION,
@@ -34,6 +41,7 @@ router = APIRouter(prefix="/api/internal-consents", tags=["internal-consents"])
 )
 def grant_internal_consent(
     payload: InternalConsentGrantRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(require_roles("ADMIN", "DOCTOR", "SUPERADMIN")),
 ) -> InternalConsentResponse:
@@ -88,8 +96,12 @@ def grant_internal_consent(
 
     db.add(
         AuditLog(
+            actor=str(user.id),
+            action="INTERNAL_CONSENT_GRANT",
+            resource_type="internal_consent",
+            resource_id=str(consent.id),
             event_type="INTERNAL_CONSENT_GRANT",
-            request_id=None,
+            request_id=f"internal-consent-grant-{consent.id}",
             hip_id=None,
             hiu_id=None,
             cm_id=None,
@@ -110,6 +122,12 @@ def grant_internal_consent(
     )
 
 
+@audited(
+    action="INTERNAL_CONSENT_REVOKE",
+    resource_type="internal_consent",
+    resource_id_getter=lambda result, _args, _kwargs: str(result.id),
+    use_request_id=False,
+)
 @router.post("/revoke", response_model=InternalConsentResponse)
 @route_policy(
     route_class=RouteClass.GOVERNANCE_MUTATION,
@@ -128,6 +146,7 @@ def grant_internal_consent(
 )
 def revoke_internal_consent(
     payload: InternalConsentRevokeRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(require_roles("ADMIN", "DOCTOR", "SUPERADMIN")),
 ) -> InternalConsentResponse:
@@ -159,8 +178,12 @@ def revoke_internal_consent(
     )
     db.add(
         AuditLog(
+            actor=str(user.id),
+            action="INTERNAL_CONSENT_REVOKE",
+            resource_type="internal_consent",
+            resource_id=str(consent.id),
             event_type="INTERNAL_CONSENT_REVOKE",
-            request_id=None,
+            request_id=f"internal-consent-revoke-{consent.id}",
             hip_id=None,
             hiu_id=None,
             cm_id=None,
